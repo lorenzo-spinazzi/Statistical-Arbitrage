@@ -1,0 +1,614 @@
+---
+title: 'Analyzing Statistical Arbitrage Methods: A Comparative Study (Code)'
+author: "Lorenzo Spinazzi"
+date: "2024-05-15"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Packages used:
+```{r, warning=FALSE, message = FALSE}
+library(quantmod)
+library(lubridate)
+library(readr)
+library(urca)
+library(ggplot2)
+library(reshape2)
+library(tseries)
+library(e1071)
+library(openxlsx)
+```
+
+# Data
+
+## SPY Data Download: 
+```{r, message=FALSE, warning=FALSE}
+# Download adjusted closing prices of SPY members
+# Downloading SPY tickers from CSV file
+tickers <- read_csv("SPY Tickers.csv")
+tics <- c()
+for(i in 1:nrow(tickers)){
+  tics <- append(tics, paste(tickers[i,1]))
+}
+
+# Getting adjusted closing price data from Yahoo Finance
+P_list <- lapply(tics, function(x) getSymbols(x, from = "2010-01-01", auto.assign = FALSE)[,6])
+P <- Reduce(merge, P_list)
+colnames(P) <- tics
+
+# Eliminate stocks with NA values
+elim_list <- c()
+for(i in 1:ncol(P)){
+  if(is.na(P[1,i]) == TRUE){
+    elim_list <- c(elim_list, i)
+  }
+}
+P <- P[, -elim_list]
+
+# Calculate (simple) returns
+R <- (P - lag(P)) / lag(P)
+R <- R[-1,]
+```
+
+## Random Date Selection Function:
+```{r}
+# Inputs:
+# "R" <- xts object of return time series
+date.selection <- function(R){
+  # Ensure after starting formation day there is at least 1.5 years of data
+  R2 <- R["2010-01-01/2022-01-01"]
+  n <- nrow(R2)
+  # Random selection of starting formation day
+  start <- sample(n, 1)
+  # Formation start and end dates
+  formation.start <- index(R[start,])
+  formation.end <- seq(formation.start, by = "year", length.out = 2)[2]
+  # Trading start and end dates
+  trade.start <- formation.end + 1
+  trade.end <- trade.start %m+% months(6)
+  # Formation interval (1 year)
+  interval.1 <- paste(formation.start, "/", formation.end, sep = "")
+  # Trading interval (6 months)
+  interval.2 <- paste(trade.start, "/", trade.end, sep = "")
+  # Formation + Trading interval
+  interval.3 <- paste(formation.start, "/", trade.end, sep = "")
+  intervals <- c(interval.1, interval.2, interval.3)
+  return(intervals)
+}
+```
+
+# Distance Method
+
+## Price Path Normalization Function
+```{r}
+# Inputs:
+# "R" <- xts object of return time series
+# "intervals" <- vector of intervals outputted from date.selection function
+normalize <- function(R, intervals){
+  R.cum <- cumprod(1 + R[intervals[3], ]) - 1
+  return(R.cum)
+}
+```
+
+## SSD Pairs Selection Function
+```{r}
+# Inputs:
+# "R" <- normalized return series FORMATION PERIOD ONLY
+# N <- desired number of pairs (top N lowest SSD)
+pairs.selection <- function(R, N){
+  min.list <- c(rep(Inf, N))
+  pairs.list <- data.frame()
+  for(i in 1:(ncol(R) - 1)){
+    for(j in (i + 1):(ncol(R))){
+      P1.name <- colnames(R[,i])
+      P2.name <- colnames(R[,j])
+      SSD.hat <- as.numeric(sum((R[,i] - R[,j])^2))
+      spread <- R[,i] - R[,j]
+      spread.mu <- mean(spread)
+      spread.sigma <- sd(spread)
+      if(nrow(pairs.list) < N){
+        pairs.list <- rbind(pairs.list, c(P1.name, P2.name, SSD.hat, spread.mu, spread.sigma))
+        min.list[which.max(min.list)] <- SSD.hat
+      }
+      else if(SSD.hat < max(min.list)){
+        pairs.list[which.max(pairs.list[,3]), ] <- c(P1.name, P2.name, SSD.hat, spread.mu, spread.sigma)
+        min.list[which.max(min.list)] <- SSD.hat
+      }
+    }
+  }
+  colnames(pairs.list) <- c("Stock 1", "Stock 2", "SSD", "Mean Spread", "Spread SD")
+  return(pairs.list)
+}
+```
+
+## Trading Function
+```{r}
+# Inputs:
+# "pairs" <- outputted from pairs.selection
+# "R.cum.trade" <- normalized returns TRADING PERIOD ONLY
+# "R.trade" <- regular returns (not normalized) TRADING PERIOD ONLY
+# "plots" <- boolean indicating whether or not you want outputted plots (T = yes)
+trade.strat <- function(pairs, R.cum.trade, R.trade, plots){
+  
+  # Initializing data frame of pair position returns
+  P.returns <- data.frame(rep(0, nrow(R.trade)))
+  P.returns <- as.xts(P.returns, order.by = index(R.trade))
+  
+  # Calculating the return time series for every pair in the portfolio
+  for(i in 1:nrow(pairs)){
+    
+    # Returns of stock 1 during trading period
+    s1.r <- as.numeric(R.trade[, which(colnames(R.trade) == pairs[i,1])])
+    
+    # Normalized (cumulative returns) returns of stock 1 during trading period
+    s1.cr <- as.numeric(R.cum.trade[, which(colnames(R.cum.trade) == pairs[i,1])])
+    
+    # Returns of stock 2 during trading period
+    s2.r <- as.numeric(R.trade[, which(colnames(R.trade) == pairs[i,2])])
+    
+    # Normalized (cumulative returns) returns of stock 2 during trading period
+    s2.cr <- as.numeric(R.cum.trade[, which(colnames(R.cum.trade) == pairs[i,2])])
+    
+    # Normalized spread
+    spread <- s1.cr - s2.cr
+    
+    # Mean spread during formation period
+    mu <- as.numeric(pairs[i, 4])
+    
+    # Spread standard deviation during formation period
+    sig <- as.numeric(pairs[i, 5])
+    
+    # Initializing trading signals (begin with neutral signal)
+    signal.list <- c(0)
+    signal <- 0 
+    
+    # Initializing vector of returns from long-short positions
+    return <- c()
+    
+    # Initialize which stock we are longing/shorting (this doesn't matter)
+    long.s <- s1.cr
+    short.s <- s2.cr
+
+    for(j in 1:nrow(R.trade)){
+
+################################################################################     
+######### If spread goes above two historical standard deviations ##############
+################################################################################
+      if((spread[j] >= (mu + 2 * sig)) & signal == 0){
+        
+        # Record the trading signal
+        signal.list <- c(signal.list, -1)
+        signal <- -1
+        
+        # No return at this time step given positions are entered the following
+        # trading day
+        return[j] <- 0
+        
+        # Determination of long stock and short stock
+        # Long "loser" short "winner"
+        if(s1.cr[j] > s2.cr[j]){
+          long.s <- s2.cr
+          long.r <- s2.r
+          short.s <- s1.cr
+          short.r <- s1.r
+        } else {
+          long.s <- s1.cr
+          long.r <- s1.r
+          short.s <- s2.cr
+          short.r <- s2.r
+        }
+      } 
+################################################################################     
+### If we are currently in an open position (-1) and paths haven't converged ###
+################################################################################
+      else if(signal == -1 & (spread[j] > mu)){
+        
+        # Record the trading signal (remains -1)
+        signal.list <- c(signal.list, -1)
+        signal <- -1
+        
+        # Calculate daily return
+        return[j] <- long.r[j] - (short.r[j]) 
+      }
+
+################################################################################      
+#### If we are currently in an open position (-1) and paths have converged #####
+################################################################################
+      else if(signal == -1 & (spread[j] <= mu)){
+        
+        # Record trading signal (back to neutral 0 for next day)
+        signal.list <- c(signal.list, 0)
+        signal <- 0
+        
+        # Calculate daily return
+        return[j] <- long.r[j] - (short.r[j])
+      }
+################################################################################      
+######### If spread goes below two historical standard deviations ##############
+################################################################################
+      else if((spread[j] <= (mu - 2 * sig)) & signal == 0){
+        signal.list <- c(signal.list, 1)
+        signal <- 1
+        return[j] <- 0
+        if(s1.cr[j] > s2.cr[j]){
+          long.s <- s2.cr
+          long.r <- s2.r
+          short.s <- s1.cr
+          short.r <- s1.r
+        } else {
+          long.s <- s1.cr
+          long.r <- s1.r
+          short.s <- s2.cr
+          short.r <- s2.r
+        }
+      } 
+################################################################################     
+### If we are currently in an open position (1) and paths haven't converged ####
+################################################################################ 
+      else if(signal == 1 & (spread[j] < mu)){
+        signal.list <- c(signal.list, 1)
+        signal <- 1
+        return[j] <- long.r[j] - (short.r[j])
+      }
+################################################################################      
+#### If we are currently in an open position (1) and paths have converged ######
+################################################################################
+      else if(signal == 1 & (spread[j] >= mu)){
+        signal.list <- c(signal.list, 0)
+        signal <- 0
+        return[j] <- long.r[j] - (short.r[j])
+      }
+################################################################################
+#### We are in a neutral position and the spread hasn't triggered a trade ######     
+################################################################################
+      else{
+        signal.list <- c(signal.list, 0)
+        signal <- 0
+        return[j] <- 0
+      }
+    }
+
+################################################################################
+############ If we want graphical representations of the process ###############  
+################################################################################    
+    if(plots == TRUE){
+      
+      # Plot normalized spread 
+      plot(spread, type = "l", main = paste(pairs[i,1], "/", pairs[i,2], " Spread ",  sep = ""), ylab = "Spread")
+      abline(h = mu, col = "black", lty = 2)
+      abline(h = (mu + 2 * sig), col = "red", lty = 2)
+      abline(h = (mu - 2 * sig), col = "red", lty = 2)
+      
+      plot(s1.cr, type = "l", col = "blue", main = paste(pairs[i,1], "/", pairs[i,2], " Normalized Price Paths",  sep = ""), ylab = "Normalized Price", ylim = c(min(c(s1.cr, s2.cr)), max(c(s1.cr, s2.cr))))
+      lines(s2.cr)
+      
+      # Plot trade signal evolution
+      plot(signal.list, type = "l", main = paste(pairs[i,1], "/", pairs[i,2], " Trade Signals ",  sep = ""), ylab = "Signal")
+
+    }
+    
+    # Add return time series to portfolio of returns
+    P.returns <- cbind(P.returns, return)
+  }
+  
+  # Return portfolio of returns
+  P.returns <- P.returns[,-1]
+  return(P.returns)
+}
+```
+
+## Pairs Portfolio Return Function
+```{r}
+# Inputs:
+# "P.returns" <- output from trade.strat function
+portfolio.return <- function(P.returns){
+  N <- ncol(P.returns)
+  w0 <- rep(1/N, N)
+  w <- data.frame()
+  w <- rbind(w, w0)
+  r <- as.numeric(P.returns[1,])
+  P.r <- c()
+  P.r[1] <- sum(w0 * r)
+  for(i in 2:nrow(P.returns)){
+    r <- as.numeric(P.returns[i - 1, ])
+    ri <- as.numeric(P.returns[i,])
+    wi <- as.numeric(w[i - 1, ] * (1 + r))
+    w <- rbind(w, wi)
+    P.r[i] <- as.numeric(sum(wi * ri))
+  }
+  return(P.r)
+}
+```
+
+# Cointegration Method
+
+## Correlated Pairs Selection Function
+```{r}
+# Inputs:
+# "R.cum.form" <- normalized returns FORMATION PERIOD ONLY
+correlation_pairs <- function(R.cum.form){
+  Sigma <- cor(R.cum.form)
+  cor_pairs <- data.frame()
+  for(i in 1:(nrow(Sigma)-1)){
+    for(j in (i+1):ncol(Sigma)){
+        if(Sigma[i,j] >= 0.80){
+          asset1 <- rownames(Sigma)[i]
+          asset2 <- colnames(Sigma)[j]
+          cor_pairs <- rbind(cor_pairs, c(asset1, asset2))
+      }
+    }
+  }
+  colnames(cor_pairs) <- c("Asset 1", "Asset 2")
+  return(cor_pairs)
+}
+```
+
+## Cointegrated Pairs Selection Function
+```{r, warning=FALSE}
+# Inputs:
+# "cor_pairs" <- output from correlation_pairs function
+# "R.cum.form" <- normalized returns FORMATION PERIOD ONLY
+cointegration <- function(cor_pairs, R.cum.form){
+  coin_pairs <- data.frame()
+  for(i in 1:nrow(cor_pairs)){
+    asset1.name <- cor_pairs[i,1]
+    asset2.name <- cor_pairs[i,2]
+    asset1 <- R.cum.form[, which(colnames(R.cum.form) == cor_pairs[i,1])]
+    asset2 <- R.cum.form[, which(colnames(R.cum.form) == cor_pairs[i,2])]
+    
+    # Cointegration test
+    test <- summary(ca.jo(data.frame(asset1, asset2), type = "trace", K = 2, ecdet = "none", spec = "longrun"))
+    if((is.na(test@teststat[2]) == FALSE) & (is.na(test@cval[2,3]) == FALSE)){
+      if(test@teststat[2] > test@cval[2,3]){
+        row.entry <- c(asset1.name, asset2.name, test@teststat[2], test@cval[2,3], test@lambda[1], test@V[1,1], test@V[2,1])
+        coin_pairs <- rbind(coin_pairs, row.entry)
+      }
+    }
+  }
+  colnames(coin_pairs) <- c("Asset 1", "Asset 2", "Test Stat", "1 pct CL", "Lambda", "Asset 1 Eigen", "Asset 2 Eigen")
+  coin_pairs <- coin_pairs[order(coin_pairs[, 3], decreasing = TRUE), ]
+  return(coin_pairs)
+}
+```
+
+## Stationary Pairs Selection Function
+```{r, warning=FALSE}
+# Inputs:
+# "coin_pairs" <- output from cointegration function
+# "R.cum.form" <- normalized returns FORMATION PERIOD ONLY
+# "N" <- top N most significant results (from Johansen Test)
+
+stationarity <- function(coin_pairs, R.cum.form, N){
+  stationary_pairs <- data.frame()
+  pair_num <- 0
+  i <- 0
+  
+  while(pair_num < N){
+    i <- i + 1
+    asset1.name <- coin_pairs[i,1]
+    asset2.name <- coin_pairs[i,2]
+    asset1 <- R.cum.form[, which(colnames(R.cum.form) == coin_pairs[i,1])]
+    asset2 <- R.cum.form[, which(colnames(R.cum.form) == coin_pairs[i,2])]
+    
+    spread <- as.numeric(asset1 - asset2)
+    SSD <- NA
+    spread.mu <- mean(spread)
+    spread.sig <- sd(spread)
+    
+    asset1 <- asset1 * as.numeric(coin_pairs[i,6])
+    asset2 <- asset2 * as.numeric(coin_pairs[i,7])
+    pair_path <- asset1 + asset2
+    
+    test <- adf.test(pair_path)
+    
+    if(test$p.value == 0.01){
+      row.entry <- c(asset1.name, asset2.name, SSD, spread.mu, spread.sig)
+      stationary_pairs <- rbind(stationary_pairs, row.entry)
+      pair_num <- pair_num + 1
+    }
+  }
+  colnames(stationary_pairs) <- c("Asset 1", "Asset 2", "SSD", "Average Spread", "Spread SD")
+  return(stationary_pairs)
+}
+```
+
+# Ornstein Uhlenbeck Method
+
+## Ornstein-Uhlenbeck Method Parameter Tune Function
+```{r}
+# Inputs:
+# "X" <- alpha/beta scaled portfolio time series values
+# "dt" <- time increment value (i.e., daily = 1/252)
+OU_tune <- function(X, dt){
+  # Leung and Li (2015) analytical derivations
+  N <- length(X)
+  Xx <- sum(X[1:(N-1)])
+  Xy <- sum(X[2:N])
+  Xxx <- sum((X[1:(N-1)])^2)
+  Xxy <- sum(X[1:(N-1)] * X[2:N])
+  Xyy <- sum(X[2:N]^2)
+
+  # Optimal theta, mu, and sigma parameters 
+  theta <- (Xy * Xxx - Xx * Xxy) / (N * (Xxx - Xxy) - (Xx^2 - Xx * Xy))
+
+  mu <- (-1 / dt) * log((Xxy - theta * Xx - theta * Xy + N * theta^2) / (Xxx - 2 * theta * Xx + N * theta^2))
+
+  sigma <- sqrt((2 * mu / (N * (1-exp(-2*mu*dt)))) * (Xyy - 2* exp(-mu * dt) * Xxy + exp(-2 * mu * dt) * Xxx - 2 * theta * (1-exp(-mu*dt)) * (Xy - Xx * exp(-mu*dt)) + N * theta^2 * (1-exp(-mu * dt))^2))
+
+  tune <- c(theta, mu, sigma)
+  return(tune)
+}
+```
+
+## Log-Likelihood Function
+```{r}
+# Inputs:
+# "X" <- alpha/beta scaled portfolio time series values
+# "tune" <- output from OU_tune
+# "dt" <- time increment value (i.e., daily = 1/252)
+log.likelihood <- function(X, tune, dt){
+  theta <- tune[1]
+  mu <- tune[2]
+  sigma <- tune[3]
+  N <- length(X)
+  sig.tilde <- sqrt(sigma^2 * ((1 - exp(-2 * mu * dt)) / (2 * mu)))
+  
+  f_sum <- 0
+  for(i in 2:N){
+    x2 <- X[i]
+    x1 <- X[i - 1]
+    
+    f_sum <- f_sum + (x2 - x1 * exp(-mu * dt) - theta * (1 - exp(-mu * dt)))^2
+  }
+  
+  output <- -0.5 * log(2 * pi) -log(sig.tilde) - (1 / (2 * N * sig.tilde^2)) * f_sum
+  return(output)
+}
+```
+
+## Optimal Beta Value Function
+```{r}
+# Inputs:
+# "s1" <- price time series of long position stock
+# "s2" <- price time series of short position stock
+# "dt" <- time increment value (i.e., daily = 1/252)
+alpha.beta.optim <- function(s1, s2, dt){
+  s1 <- as.numeric(s1)
+  s2 <- as.numeric(s2)
+  ratio <- seq(0.001, 1, 0.001)
+  f <- c()
+  a <- 1 / s1[1]
+  for(i in 1:length(ratio)){
+    b <- ratio[i] / s2[1]
+    X <- a * s1 - b * s2
+    tune <- OU_tune(X, dt)
+    f[i] <- log.likelihood(X, tune, dt)
+  }
+  max <- ratio[which(f == max(f))]
+  b <- max / s2[1]
+  alpha.beta <- c(a,b)
+  return(alpha.beta)
+}
+```
+
+## Ornstein Trading Function
+```{r}
+# Inputs
+# "pairs" <- selected pair
+# "intervals" <- vector of intervals outputted from date.selection function 
+# "dt" <- time increment value (i.e., daily = 1/252)
+# "plots" <- boolean indicating whether or not you want outputted plots (T = yes)
+OU.trade <- function(pairs, intervals, dt, plots){
+
+  # Stock pair chosen from SSD criteria
+  asset1 <- P[, which(colnames(P) == pairs[1,1])]
+  asset2 <- P[, which(colnames(P) == pairs[1,2])] 
+  pair <- cbind(asset1, asset2)
+  
+  # Formation period prices
+  s1.form <- as.numeric(pair[intervals[1],1])
+  s2.form <- as.numeric(pair[intervals[1],2])
+  
+  # OU parameter calculation
+  alpha.beta <- alpha.beta.optim(s1.form, s2.form, dt)
+  alpha <- alpha.beta[1]
+  beta <- alpha.beta[2]
+  
+  # Forming OU process
+  OU.form <- alpha * s1.form - beta * s2.form
+  
+  # Trade signals
+  mu <- mean(OU.form)
+  sigma <- sd(OU.form)
+  
+  # Trading period prices
+  s1.trade <- as.numeric(pair[intervals[2],1])
+  s2.trade <- as.numeric(pair[intervals[2],2])
+  
+  # OU process for trading period
+  OU.test <- alpha * s1.trade - beta * s2.trade
+ 
+  # Initializing signal and return vectors 
+  signal <- 0
+  signal_list <- c(0)
+  returns <- c()
+  
+  for(i in 2:length(OU.test)){
+    
+    # OU process hits bottom threshold
+    if((OU.test[i] <= (mu - 2 * sigma)) & (signal == 0)){
+      # Long spread signal initiated for next iteration
+      signal <- 1
+      signal_list[i] <- 1
+      returns[i - 1] <- 0
+    }
+    
+    # Long spread active, remain in long spread (calculate return)
+    else if((OU.test[i] < mu) & (signal == 1)){
+      signal <- 1
+      signal_list[i] <- 1
+      returns[i - 1] <- ((s1.trade[i] - s1.trade[i - 1]) / s1.trade[i - 1]) + ((s2.trade[i - 1] - s2.trade[i]) / s2.trade[i])
+    }
+    
+    # Long spread active, mean reversion, close long spread position, still calculate this day's return
+    else if((OU.test[i] >= mu) & (signal == 1)){
+      signal <- 0
+      signal_list[i] <- 0
+      returns[i - 1] <- ((s1.trade[i] - s1.trade[i - 1]) / s1.trade[i - 1]) + ((s2.trade[i - 1] - s2.trade[i]) / s2.trade[i])
+    }
+    
+    # OU process hits top threshold
+    else if((OU.test[i] >= (mu + 2 * sigma)) & (signal == 0)){
+      # Short spread signal initiated for next iteration
+      signal <- -1
+      signal_list[i] <- -1
+      returns[i - 1] <- 0     
+    }
+    
+    # Short spread active, remain in short spread (calculate return)
+    else if((OU.test[i] > mu) & (signal == -1)){
+      signal <- -1
+      signal_list[i] <- -1
+      returns[i - 1] <- ((s2.trade[i] - s2.trade[i - 1]) / s2.trade[i - 1]) + ((s1.trade[i - 1] - s1.trade[i]) / s1.trade[i])
+    }
+    
+    # Short spread active, mean reversion, close short spread position, still calculate this day's return
+    else if((OU.test[i] <= mu) & (signal == -1)){
+      signal <- 0
+      signal_list[i] <- 0
+      returns[i - 1] <- ((s2.trade[i] - s2.trade[i - 1]) / s2.trade[i - 1]) + ((s1.trade[i - 1] - s1.trade[i]) / s1.trade[i])
+    }
+    
+    # No signal triggered and we have no active positions
+    else if(signal == 0){
+      signal <- 0
+      signal_list[i] <- 0
+      returns[i - 1] <- 0
+    }
+    
+  }
+  
+  # Plot results 
+  if(plots == TRUE){
+    OU.overall <- c(OU.form, OU.test)
+    plot(OU.overall, type = "l", main = paste(colnames(asset1), " + ", colnames(asset2), " Ornstein-Uhlenbeck Trade", sep = ""), ylab = "OU Process", xlab = "Day")
+    abline(h = mu, col = "red", lty = 2)
+    abline(h = (mu + sigma), col = "blue", lty = 2)
+    abline(h = (mu - sigma), col = "blue", lty = 2)
+    abline(v = length(s1.form), lty = 2, col = "green")
+    
+    legend("topleft", legend = c("OU Process", "Trade Signals", "Long Term Average", "Formation/Trading Split"), col = c("black", "blue", "red", "green"), lty = c(1,2,2,2), cex = 0.8)
+    
+    plot(signal_list, type = "l", ylab = "Signal", xlab = "Day")
+    abline(h = 1, lty = 2, col = "red")
+    abline(h = -1, lty = 2, col = "green")
+    abline(h = 0, lty = 2, col = "black")
+  }
+    return(returns)
+}
+```
+
+
